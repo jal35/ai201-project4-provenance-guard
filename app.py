@@ -1,9 +1,10 @@
 """
-Provenance Guard — Milestone 3 backend.
+Provenance Guard — Milestone 4 backend.
 
-A small Flask service that accepts text submissions, runs a first AI-detection
-signal through the Groq LLM API, assigns a provenance attribution, and appends a
-structured entry to a persistent append-only audit log.
+A small Flask service that accepts text submissions, runs two independent
+AI-detection signals (a Groq LLM signal and a pure-Python stylometric signal),
+combines them into a single confidence score, assigns a provenance attribution,
+and appends a structured entry to a persistent append-only audit log.
 
 Endpoints
 ---------
@@ -16,8 +17,11 @@ GROQ_API_KEY   Required. Your Groq API key (loaded from the environment or .env)
 
 Usage
 -----
-    # Test the Groq signal function on its own, without starting the server:
+    # Test the Groq signal on its own, without starting the server:
     python app.py test "The quick brown fox jumps over the lazy dog."
+
+    # Test the stylometric heuristic signal on its own:
+    python app.py heuristic "The quick brown fox jumps over the lazy dog."
 
     # Start the Flask server on localhost:5000:
     python app.py
@@ -26,6 +30,7 @@ Usage
 import json
 import os
 import re
+import statistics
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -44,10 +49,17 @@ load_dotenv()
 GROQ_MODEL = "llama-3.3-70b-versatile"
 LOG_PATH = Path(__file__).with_name("log.json")
 
-# Milestone 3 placeholders. These are wired in for the API contract now and will
-# be replaced with real values once the additional detection signals land.
-PLACEHOLDER_CONFIDENCE = 0.5
+# Scoring-engine weights. The combined confidence score is:
+#     (groq_score * GROQ_WEIGHT) + (heuristic_score * HEURISTIC_WEIGHT)
+GROQ_WEIGHT = 0.6
+HEURISTIC_WEIGHT = 0.4
+
+# Attribution threshold applied to the combined confidence score.
 ATTRIBUTION_THRESHOLD = 0.5
+
+# Milestone 5 placeholder. The human-facing transparency label is derived from
+# the confidence score in M5; until then we log a fixed placeholder.
+PLACEHOLDER_LABEL = "pending_m5_transparency_label"
 
 app = Flask(__name__)
 
@@ -118,6 +130,81 @@ def _parse_score(raw: str) -> float:
 
 
 # --------------------------------------------------------------------------- #
+# Detection signal 2: stylometric heuristics (pure Python, no external calls)
+# --------------------------------------------------------------------------- #
+
+# Sentence-length variability is measured with the coefficient of variation
+# (std / mean). Human prose is "bursty" — a CV at or above this cap reads as
+# fully chaotic; a CV of 0 (perfectly uniform sentences) reads as fully rigid.
+CV_CAP = 1.0
+
+# Punctuation density is punctuation marks per word. Human writing tends to be
+# richer in expressive punctuation (dashes, semicolons, parentheticals); this
+# density is treated as "fully human". Sparser punctuation reads as more rigid.
+PUNCTUATION_DENSITY_CAP = 0.30
+
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?]+")
+_WORD_RE = re.compile(r"\b\w+\b")
+_PUNCTUATION_RE = re.compile(r"""[.,;:!?…\-—–'"()\[\]{}]""")
+
+
+def evaluate_heuristic_signal(text: str) -> float:
+    """Score how AI-like `text` is from its style alone, no model call.
+
+    Combines two stylometric measures, each mapped so that a rigid, uniform
+    style scores high and a varied, chaotic style scores low:
+
+      * Sentence-length uniformity — the inverse of the coefficient of
+        variation of per-sentence word counts. Uniform sentence lengths look
+        machine-like; wildly varying lengths look human.
+      * Punctuation sparsity — the inverse of punctuation density (marks per
+        word). Rich, frequent punctuation looks human; sparse punctuation
+        looks rigid.
+
+    The two measures are averaged equally into a single score in [0.0, 1.0],
+    where 0.0 is a highly variable, chaotic human style and 1.0 is a highly
+    uniform, rigid AI style.
+    """
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    word_counts = [len(_WORD_RE.findall(s)) for s in sentences]
+    word_counts = [c for c in word_counts if c > 0]
+    total_words = sum(word_counts)
+
+    # --- Measure 1: sentence-length uniformity ---
+    if len(word_counts) >= 2 and statistics.mean(word_counts) > 0:
+        mean_len = statistics.mean(word_counts)
+        cv = statistics.pstdev(word_counts) / mean_len
+        uniformity = 1.0 - min(cv / CV_CAP, 1.0)
+    else:
+        # Too little structure to judge variability; stay neutral.
+        uniformity = 0.5
+
+    # --- Measure 2: punctuation sparsity ---
+    if total_words > 0:
+        punctuation_count = len(_PUNCTUATION_RE.findall(text))
+        density = punctuation_count / total_words
+        sparsity = 1.0 - min(density / PUNCTUATION_DENSITY_CAP, 1.0)
+    else:
+        sparsity = 0.5
+
+    score = (uniformity + sparsity) / 2.0
+    return max(0.0, min(1.0, score))
+
+
+# --------------------------------------------------------------------------- #
+# Scoring engine
+# --------------------------------------------------------------------------- #
+
+def calculate_confidence_score(groq_score: float, heuristic_score: float) -> float:
+    """Combine the two signals into a single confidence score in [0.0, 1.0].
+
+    Formula: (groq_score * 0.6) + (heuristic_score * 0.4).
+    """
+    combined = (groq_score * GROQ_WEIGHT) + (heuristic_score * HEURISTIC_WEIGHT)
+    return max(0.0, min(1.0, combined))
+
+
+# --------------------------------------------------------------------------- #
 # Persistent audit log (append-only log.json)
 # --------------------------------------------------------------------------- #
 
@@ -165,15 +252,20 @@ def submit():
     if llm_score < 0:
         return jsonify(error="Detection signal unavailable; submission was not classified."), 502
 
-    attribution = "likely_ai" if llm_score > ATTRIBUTION_THRESHOLD else "likely_human"
+    heuristic_score = evaluate_heuristic_signal(text)
+    confidence = calculate_confidence_score(llm_score, heuristic_score)
+
+    attribution = "likely_ai" if confidence > ATTRIBUTION_THRESHOLD else "likely_human"
 
     entry = {
         "content_id": content_id,
         "creator_id": creator_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "attribution": attribution,
-        "confidence": PLACEHOLDER_CONFIDENCE,  # placeholder — combined score TBD
+        "confidence": confidence,  # real combined score (groq*0.6 + heuristic*0.4)
         "llm_score": llm_score,
+        "heuristic_score": heuristic_score,
+        "label": PLACEHOLDER_LABEL,  # placeholder — transparency label lands in M5
         "status": "classified",
     }
     append_log(entry)
@@ -191,6 +283,12 @@ def get_log():
 # Entry point
 # --------------------------------------------------------------------------- #
 
+_DEFAULT_SAMPLE = (
+    "In today's fast-paced digital landscape, leveraging synergistic "
+    "solutions is paramount to unlocking transformative value."
+)
+
+
 def _run_signal_test(text: str) -> None:
     """Exercise evaluate_groq_signal from the terminal without the server."""
     print(f"Text under test:\n  {text!r}\n")
@@ -203,12 +301,22 @@ def _run_signal_test(text: str) -> None:
     print(f"Attribution: {label}")
 
 
+def _run_heuristic_test(text: str) -> None:
+    """Exercise evaluate_heuristic_signal from the terminal without the server."""
+    print(f"Text under test:\n  {text!r}\n")
+    score = evaluate_heuristic_signal(text)
+    label = "likely_ai" if score > ATTRIBUTION_THRESHOLD else "likely_human"
+    print(f"Heuristic score: {score:.3f}  (0.0 = chaotic/human, 1.0 = rigid/AI)")
+    print(f"Style read     : {label}")
+
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "test":
-        sample = sys.argv[2] if len(sys.argv) > 2 else (
-            "In today's fast-paced digital landscape, leveraging synergistic "
-            "solutions is paramount to unlocking transformative value."
-        )
+    mode = sys.argv[1] if len(sys.argv) > 1 else None
+    sample = sys.argv[2] if len(sys.argv) > 2 else _DEFAULT_SAMPLE
+
+    if mode == "test":
         _run_signal_test(sample)
+    elif mode == "heuristic":
+        _run_heuristic_test(sample)
     else:
         app.run(host="127.0.0.1", port=5000, debug=True)
