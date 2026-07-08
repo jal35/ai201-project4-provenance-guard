@@ -5,7 +5,7 @@ Provenance Guard is a Flask-based backend system designed to evaluate text submi
 
 ## Architecture Overview
 When a payload is submitted to the system, it follows this path:
-1. **Ingress & Protection:** A request hits the `POST /submit` endpoint and passes through a Flask-Limiter check to ensure it hasn't exceeded the rate limit.
+1. **Access & Protection:** A request hits the `POST /submit` endpoint and passes through a Flask-Limiter check to ensure it hasn't exceeded the rate limit.
 2. **Identification:** The system mints a unique UUID (`content_id`) for the submission.
 3. **Evaluation:** The text is passed to two distinct detection signals: an LLM API (Groq) and a local stylometric heuristic engine.
 4. **Scoring:** The outputs from both signals are fed into a weighted scoring engine to produce a final confidence score (0.0 to 1.0).
